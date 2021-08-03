@@ -18,7 +18,7 @@ class HatefulMemesDataset(torch.utils.data.Dataset):
             random_state=0,
     ):
         print(data_path)
-        self.samples_frame = pd.read_json(data_path, lines=True)
+        self.samples_frame = pd.read_json(data_path, lines=True) # all
         print(data_path)
         self.dev_limit = dev_limit
 
@@ -62,11 +62,23 @@ class HatefulMemesDataset(torch.utils.data.Dataset):
         ).convert("RGB")
         image = self.image_transform(image)
 
-        text = torch.Tensor(
-            self.text_transform.get_sentence_vector(
-                self.samples_frame.loc[idx, "text"]
+        # text = torch.Tensor(
+        #     self.text_transform.get_sentence_vector(
+        #         self.samples_frame.loc[idx, "text"]
+        #     )
+        # ).squeeze() # Tensor(150)
+        # # print(list(text.shape))
+
+        encoded = self.text_transform.encode_plus(
+            text=self.samples_frame.loc[idx, "text"],
+            add_special_tokens=True,  # Add [CLS] and [SEP]
+            max_length=100,  # maximum length of a sentence
+            pad_to_max_length=True,  # Add [PAD]s
+            truncation=True,
+            return_attention_mask=True,  # Generate the attention mask
             )
-        ).squeeze()
+        text = torch.Tensor(encoded.data.get('input_ids')).squeeze()
+        #print(str(len(text)) + ", " + str(text.dtype))
 
         if "label" in self.samples_frame.columns:
             label = torch.Tensor(

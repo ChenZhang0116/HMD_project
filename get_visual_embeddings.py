@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import cupy as cp
 
 from detectron2.modeling import build_model
 from detectron2.checkpoint import DetectionCheckpointer
@@ -37,7 +38,7 @@ def load_config_and_model_weights(cfg_path):
     cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
 
     # Comment the next line if you're using 'cuda'
-    cfg['MODEL']['DEVICE'] = 'cpu'
+    #cfg['MODEL']['DEVICE'] = 'cpu'
 
     cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(cfg_path)
 
@@ -62,7 +63,7 @@ def get_model(cfg):
 # Convert image to model input: The detectron uses resizing and normalization based on the configuration parameters
 # and the input is to be provided using ImageList. The model.backbone.size_divisibility handles the sizes (padding)
 # such that the FPN lateral and output convolutional features have same dimensions.
-def prepare_image_inputs(cfg, img_list):
+def prepare_image_inputs(cfg, img_list, divisibility_size):
     # Resizing the image according to the configuration
     transform_gen = T.ResizeShortestEdge(
         [cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MIN_SIZE_TEST], cfg.INPUT.MAX_SIZE_TEST
@@ -83,8 +84,16 @@ def prepare_image_inputs(cfg, img_list):
     images = [normalizer(x["image"]) for x in batched_inputs]
 
     # Convert to ImageList
-    images = ImageList.from_tensors(images, model.backbone.size_divisibility)
+    images = ImageList.from_tensors(images, divisibility_size)
 
+    return images, batched_inputs
+
+
+def prepare_image_inputs_cuda(cfg, image_tensor,
+                              divisibility_size):  # image_tensor should be a tensor of size (B,3,224,224)
+    batched_inputs = [{"image": image_tensor[i,], "height": image_tensor.shape[2], "width": image_tensor.shape[3]}
+                      for i in range(image_tensor.shape[0])]
+    images = ImageList.from_tensors(image_tensor, divisibility_size)
     return images, batched_inputs
 
 
@@ -110,7 +119,7 @@ def get_proposals(model, images, features):
 # The proposals and features are then used by the ROI heads to get the
 # predictions. In this case, the partial execution of layers becomes significant. We want the box_features to be the
 # fc2 outputs of the regions. Hence, I use only the layers that are needed until that step.
-def get_box_features(model, features, proposals):
+def get_box_features(model, features, proposals, N_image):
     features_list = [features[f] for f in ['p2', 'p3', 'p4', 'p5']]
     box_features = model.roi_heads.box_pooler(features_list, [x.proposal_boxes for x in proposals])
     box_features = model.roi_heads.box_head.flatten(box_features)
@@ -133,7 +142,7 @@ def get_prediction_logits(model, features_list, proposals):
 
 
 # Get FastRCNN scores and boxes: This results in the softmax scores and the boxes.
-def get_box_scores(cfg, pred_class_logits, pred_proposal_deltas):
+def get_box_scores(cfg, pred_class_logits, pred_proposal_deltas, proposals):
     box2box_transform = Box2BoxTransform(weights=cfg.MODEL.ROI_BOX_HEAD.BBOX_REG_WEIGHTS)
     smooth_l1_beta = cfg.MODEL.ROI_BOX_HEAD.SMOOTH_L1_BETA
 
@@ -176,14 +185,24 @@ def get_output_boxes(boxes, batched_inputs, image_size):
 def select_boxes(cfg, output_boxes, scores):
     test_score_thresh = cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST
     test_nms_thresh = cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST
+
     cls_prob = scores.detach()
     cls_boxes = output_boxes.tensor.detach().reshape(1000, 80, 4)
-    max_conf = torch.zeros((cls_boxes.shape[0]))
-    for cls_ind in range(0, cls_prob.shape[1] - 1):
-        cls_scores = cls_prob[:, cls_ind + 1]
-        det_boxes = cls_boxes[:, cls_ind, :]
-        keep = np.array(nms(det_boxes, cls_scores, test_nms_thresh))
+
+    dvc = cls_prob.device.type
+    max_conf = torch.zeros((cls_boxes.shape[0]), device=dvc)  # tensor(1000,)
+
+    # 为这张图片在(80+1)*1000个备选box中选出conf最高的1000个box:
+    for cls_ind in range(0, cls_prob.shape[1] - 1):  # [0,80) for each classes
+        cls_scores = cls_prob[:, cls_ind + 1]  # (1000,)
+        det_boxes = cls_boxes[:, cls_ind, :]  # (1000,4)
+
+        if dvc == 'cuda':
+            keep = nms(det_boxes, cls_scores, test_nms_thresh)  # ndarray(496,) in cuda
+        else:  # in cpu
+            keep = np.array(nms(det_boxes, cls_scores, test_nms_thresh))
         max_conf[keep] = torch.where(cls_scores[keep] > max_conf[keep], cls_scores[keep], max_conf[keep])
+
     keep_boxes = torch.where(max_conf >= test_score_thresh)[0]
     return keep_boxes, max_conf
 
@@ -203,84 +222,40 @@ def filter_boxes(keep_boxes, max_conf, min_boxes, max_boxes):
     return keep_boxes
 
 
+def filter_boxes_cuda(keep_boxes, max_conf, min_boxes, max_boxes):
+    if len(keep_boxes) < min_boxes:
+        keep_boxes = cp.argsort(max_conf)[:-1:][:min_boxes]
+    elif len(keep_boxes) > max_boxes:
+        keep_boxes = cp.argsort(max_conf)[:-1:][:max_boxes]
+    return keep_boxes
+
+
 # Get the visual embeddings :)
 # Finally, the boxes are chosen using the keep_boxes indices and from the box_features tensor.
 def get_visual_embeds(box_features, keep_boxes):
     return box_features[keep_boxes.copy()]
 
 
-# load descriptor list of training samples + print statistics:
-train_samples_frame = pd.read_json(train_path, lines=True)
-train_samples_frame = train_samples_frame.reset_index(drop=True)
-train_samples_frame.img = train_samples_frame.apply(lambda row: (data_dir / row.img), axis=1)
-
-N_image = 5
-image_list = [cv2.cvtColor(cv2.imread(str(data_dir / train_samples_frame.loc[i, "img"])), cv2.COLOR_RGB2BGR)
-              for i in range(N_image)]
-
-# load config and model weights:
-cfg_path = "COCO-InstanceSegmentation/mask_rcnn_R_101_FPN_3x.yaml"
-cfg = load_config_and_model_weights(cfg_path)
-
-model = get_model(cfg)
-
-images, batched_inputs = prepare_image_inputs(cfg, image_list)
-# images: ImageList of 5
-# batched_inputs: list of 5 dicts, each containing a Tensor representation of the image and some ints for dimensions
-
-features = get_features(model, images)
-# features: dict of 5 Tensors
-features.keys()
-
-# visualize image and image features:
-# plt.imshow(cv2.resize(image_list[-1], list(images.tensor.shape[-2:][::-1])))
-# plt.show()
-# for key in features.keys():
-#     print(features[key].shape)
-#     plt.imshow(features[key][1, 0, :, :].squeeze().detach().numpy(), cmap='jet')  # only showing for picture1
-#     plt.show()
+def get_visual_embeds_cuda(box_features, keep_boxes):
+    return box_features[keep_boxes.clone()]
 
 
-proposals = get_proposals(model, images, features)
-# proposals: list of 5 Instances containing  proposed boxes for each image
-
-box_features, features_list = get_box_features(model, features, proposals)
-# box_features: Tensor:(2,1600,1600)
-# feature_list: list of 4 Tensors from high to low resolution
-
-pred_class_logits, pred_proposal_deltas = get_prediction_logits(model, features_list, proposals)
-# pred_class_logits: Tensor(5000,81)
-# pred_proposal_deltas: Tensor(5000,320)
-
-boxes, scores, image_shapes = get_box_scores(cfg, pred_class_logits, pred_proposal_deltas)
-# boxes: tuple of 5 Tensors in same size (1000,320)
-# scores: tuple of 5 Tensors in same size (1000,81)
-# image_shapes: list of 5 tuples representing shape
-
-output_boxes = [get_output_boxes(boxes[i], batched_inputs[i], proposals[i].image_size) for i in range(len(proposals))]
-# output_boxes: as list of 5 Boxes of len 80000
-
-temp = [select_boxes(cfg, output_boxes[i], scores[i]) for i in range(len(scores))]
-keep_boxes, max_conf = [], []
-for keep_box, mx_conf in temp:
-    keep_boxes.append(keep_box)
-    max_conf.append(mx_conf)
-
-keep_boxes = [filter_boxes(keep_box, mx_conf, MIN_BOXES, MAX_BOXES) for keep_box, mx_conf in zip(keep_boxes, max_conf)]
-# keep_boxes: list of 5 ndarray with size of 100
-
-
-visual_embeds = [get_visual_embeds(box_feature, keep_box) for box_feature, keep_box in zip(box_features, keep_boxes)]
-# visual_embeds: list of 2 Tensor(100,1600)
-
-
-def get_visual_embeddings(image_list, cfg_path):
+def get_visual_embeddings(image_list, cfg_path, N_image):
     cfg = load_config_and_model_weights(cfg_path)
     model = get_model(cfg)
-    images, batched_inputs = prepare_image_inputs(cfg, image_list)
+
+    images, batched_inputs = prepare_image_inputs(cfg, image_list, divisibility_size=model.backbone.size_divisibility)
+
     features = get_features(model, images)
+
     proposals = get_proposals(model, images, features)
-    box_features, features_list = get_box_features(model, features, proposals)
+
+    box_features, features_list = get_box_features(model, features, proposals, N_image)
+
+    pred_class_logits, pred_proposal_deltas = get_prediction_logits(model, features_list, proposals)
+
+    boxes, scores, image_shapes = get_box_scores(cfg, pred_class_logits, pred_proposal_deltas, proposals)
+
     output_boxes = [get_output_boxes(boxes[i], batched_inputs[i], proposals[i].image_size) for i in
                     range(len(proposals))]
     temp = [select_boxes(cfg, output_boxes[i], scores[i]) for i in range(len(scores))]
@@ -292,7 +267,67 @@ def get_visual_embeddings(image_list, cfg_path):
                   zip(keep_boxes, max_conf)]
     visual_embeds = [get_visual_embeds(box_feature, keep_box) for box_feature, keep_box in
                      zip(box_features, keep_boxes)]
-    return visual_embeds
+
+    visual_embeds_ = torch.cat([torch.unsqueeze(visual_embeds[i], 0)
+                                for i in range(len(visual_embeds))], 0)  # in tensor
+    return visual_embeds_
+
+
+def get_visual_embeddings_cuda(image_tensor, cfg_path, N_image):
+    cfg = load_config_and_model_weights(cfg_path)
+    model = get_model(cfg)
+
+    print("[get_visual_embeddings_cuda] image_tensor device type = " + str(image_tensor.device))
+
+    batched_inputs = [{"image": image_tensor[i,], "height": image_tensor.shape[2], "width": image_tensor.shape[3]}
+                      for i in range(image_tensor.shape[0])]
+    images = ImageList.from_tensors([x["image"] for x in batched_inputs], model.backbone.size_divisibility)
+
+    print("[get_visual_embeddings_cuda] images device type = " + str(images.device))
+
+    features = get_features(model, images)
+    proposals = get_proposals(model, images, features)
+
+    box_features, features_list = get_box_features(model, features, proposals, N_image)
+
+    pred_class_logits, pred_proposal_deltas = get_prediction_logits(model, features_list, proposals)
+
+    boxes, scores, image_shapes = get_box_scores(cfg, pred_class_logits, pred_proposal_deltas, proposals)
+
+    output_boxes = [get_output_boxes(boxes[i], batched_inputs[i], proposals[i].image_size) for i in
+                    range(len(proposals))]
+    temp = [select_boxes(cfg, output_boxes[i], scores[i]) for i in range(len(scores))]
+    keep_boxes, max_conf = [], []
+    for keep_box, mx_conf in temp:
+        keep_boxes.append(keep_box)
+        max_conf.append(mx_conf)
+    keep_boxes = [filter_boxes_cuda(keep_box, mx_conf, MIN_BOXES, MAX_BOXES) for keep_box, mx_conf in
+                  zip(keep_boxes, max_conf)]
+    visual_embeds = [get_visual_embeds_cuda(box_feature, keep_box) for box_feature, keep_box in
+                     zip(box_features, keep_boxes)]
+    visual_embeds_ = torch.cat([torch.unsqueeze(visual_embeds[i], 0)
+                                for i in range(len(visual_embeds))], 0)  # in tensor
+    return visual_embeds_
+
+
+# load descriptor list of training samples + print statistics:
+
+# train_samples_frame = pd.read_json(train_path, lines=True)
+# train_samples_frame = train_samples_frame.reset_index(drop=True)
+# train_samples_frame.img = train_samples_frame.apply(lambda row: (data_dir / row.img), axis=1)
+#
+N_image = 4
+# image_list = [cv2.cvtColor(cv2.imread(str(data_dir / train_samples_frame.loc[i, "img"])), cv2.COLOR_RGB2BGR)
+#               for i in range(N_image)]
+#
+# # load config and model weights:
+cfg_path = "COCO-InstanceSegmentation/mask_rcnn_R_101_FPN_3x.yaml"
+# #visual_embeds2 = get_visual_embeddings(image_list, cfg_path, N_image)
+dummy_tensor = torch.zeros(4, 3, 224, 224, device='cuda')
+visual_embeds_from_tensor = get_visual_embeddings_cuda(dummy_tensor, cfg_path, N_image=4)
+
+# cfg = load_config_and_model_weights(cfg_path)
+# model = get_model(cfg)
 
 
 
@@ -304,11 +339,60 @@ def get_visual_embeddings(image_list, cfg_path):
 
 
 
+# in-step excution for:
 
-
-
-
-
-
-
-
+# cfg = load_config_and_model_weights(cfg_path)
+# model = get_model(cfg)
+#
+# # list images:
+# # images, batched_inputs = prepare_image_inputs(cfg, image_list, model.backbone.size_divisibility)
+#
+# # tensor images:
+# batched_inputs = [{"image": dummy_tensor[i,], "height": dummy_tensor.shape[2], "width": dummy_tensor.shape[3]}
+#                   for i in range(dummy_tensor.shape[0])]
+# images = ImageList.from_tensors([x["image"] for x in batched_inputs], model.backbone.size_divisibility)
+#
+# features = get_features(model, images)
+# features.keys()
+# # visualize image and image features:
+# # plt.imshow(cv2.resize(image_list[-1], list(images.tensor.shape[-2:][::-1])))
+# # plt.show()
+# # for key in features.keys():
+# #     print(features[key].shape)
+# #     plt.imshow(features[key][1, 0, :, :].squeeze().detach().numpy(), cmap='jet')  # only showing for picture1
+# #     plt.show()
+#
+#
+# proposals = get_proposals(model, images, features)
+# # proposals: list of B Instances containing  proposed boxes for each image
+#
+# box_features, features_list = get_box_features(model, features, proposals, N_image)
+# # box_features: Tensor:(B,1000,1024)
+# # feature_list: list of B Tensors from high to low resolution
+#
+# pred_class_logits, pred_proposal_deltas = get_prediction_logits(model, features_list, proposals)
+# # pred_class_logits: Tensor(B*1000,81)
+# # pred_proposal_deltas: Tensor(B*1000,320)
+#
+# boxes, scores, image_shapes = get_box_scores(cfg, pred_class_logits, pred_proposal_deltas, proposals)
+# # boxes: tuple of B Tensors in same size (1000,320)
+# # scores: tuple of B Tensors in same size (1000,81)
+# # image_shapes: list of 5 tuples representing shape
+#
+# output_boxes = [get_output_boxes(boxes[i], batched_inputs[i], proposals[i].image_size) for i in range(len(proposals))]
+# # output_boxes: as list of B Boxes of len 80000
+#
+# temp = [select_boxes(cfg, output_boxes[i], scores[i]) for i in range(len(scores))]
+# keep_boxes, max_conf = [], []
+# for keep_box, mx_conf in temp:
+#     keep_boxes.append(keep_box)
+#     max_conf.append(mx_conf)
+#
+# keep_boxes = [filter_boxes_cuda(keep_box, mx_conf, MIN_BOXES, MAX_BOXES) for keep_box, mx_conf in
+#               zip(keep_boxes, max_conf)]
+# # keep_boxes: list of 5 ndarray with size of 100
+# # zip: B tuples of 2 tensors corresponding to each image
+#
+# visual_embeds = [get_visual_embeds_cuda(box_feature, keep_box) for box_feature, keep_box in
+#                  zip(box_features, keep_boxes)]
+# # visual_embeds: list of B Tensor(100,1024)

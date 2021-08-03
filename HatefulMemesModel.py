@@ -21,6 +21,8 @@ from pytorch_lightning.core import optimizer
 from HatefulMemesDataset import HatefulMemesDataset
 from LanguageAndVisionConcat import LanguageAndVisionConcat
 
+from transformers import BertTokenizer
+
 warnings.filterwarnings("ignore")
 logging.getLogger().setLevel(logging.WARNING)
 
@@ -157,6 +159,7 @@ class HatefulMemesModel(LightningModule):
     def _build_text_transform(self):
         with tempfile.NamedTemporaryFile() as ft_training_data:
             ft_path = Path(ft_training_data.name)
+            print("ft_path = "+str(ft_path))
             with ft_path.open("w") as ft:
                 training_data = [
                     json.loads(line)["text"] + "/n"
@@ -166,11 +169,12 @@ class HatefulMemesModel(LightningModule):
                 ]
                 for line in training_data:
                     ft.write(line + "\n")
-                language_transform = fasttext.train_unsupervised(
-                    str(ft_path),
-                    model=self.hparams.get("fasttext_model", "cbow"),
-                    dim=self.embedding_dim
-                )
+                # language_transform = fasttext.train_unsupervised(
+                #     str(ft_path),
+                #     model=self.hparams.get("fasttext_model", "cbow"),
+                #     dim=self.embedding_dim
+                # )
+                language_transform = BertTokenizer.from_pretrained("bert-base-uncased")
         return language_transform
 
     def _build_image_transform(self):
@@ -216,28 +220,28 @@ class HatefulMemesModel(LightningModule):
         # we're going to pass the outputs of our text
         # transform through an additional trainable layer
         # rather than fine-tuning the transform
-        language_module = torch.nn.Linear(
-            in_features=self.embedding_dim,
-            out_features=self.language_feature_dim
-        )
+        # language_module = torch.nn.Linear(
+        #     in_features=self.embedding_dim,
+        #     out_features=self.language_feature_dim
+        # )
 
         # easiest way to get features rather than
         # classification is to overwrite last layer
         # with an identity transformation, we'll reduce
         # dimension using a Linear layer, resnet is 2048 out
-        vision_module = torchvision.models.resnet152(
-            pretrained=True
-        )
-        vision_module.fc = torch.nn.Linear(
-            in_features=2048,
-            out_features=self.vision_feature_dim
-        )
+        # vision_module = torchvision.models.resnet152(
+        #     pretrained=True
+        # )
+        # vision_module.fc = torch.nn.Linear(
+        #     in_features=2048,
+        #     out_features=self.vision_feature_dim
+        # )
 
         return LanguageAndVisionConcat(
             num_classes=self.hparams.get("num_classes", 2),
             loss_fn=torch.nn.CrossEntropyLoss(),
-            language_module=language_module,
-            vision_module=vision_module,
+            # language_module=language_module,
+            # vision_module=vision_module,
             language_feature_dim=self.language_feature_dim,
             vision_feature_dim=self.vision_feature_dim,
             fusion_output_size=self.hparams.get(
@@ -288,7 +292,6 @@ class HatefulMemesModel(LightningModule):
     def make_submission_frame(self, test_path):
         self.hparams.update()
 
-
         test_dataset = self._build_dataset(test_path)
         submission_frame = pd.DataFrame(
             index=test_dataset.samples_frame.id,
@@ -300,9 +303,12 @@ class HatefulMemesModel(LightningModule):
             batch_size=self.hparams.get("batch_size", 4),
             num_workers=self.hparams.get("num_workers", 16))
         for batch in tqdm(test_dataloader, total=len(test_dataloader)):
-            preds, _ = self.model.eval().to("cpu")(
+            preds, _ = self.model.eval().to("cuda")(
                 batch["text"], batch["image"]
-            )
+            )  # preds: a tensor(B,2)
+
+            preds = preds.cpu()
+
             submission_frame.loc[batch["id"], "proba"] = preds[:, 1]
             submission_frame.loc[batch["id"], "label"] = preds.argmax(dim=1)
         submission_frame.proba = submission_frame.proba.astype(float)

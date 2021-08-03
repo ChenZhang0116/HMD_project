@@ -1,4 +1,7 @@
 from pathlib import Path
+
+import torch
+
 from HatefulMemesModel import HatefulMemesModel
 import pandas as pd
 from sklearn.metrics import roc_auc_score
@@ -11,11 +14,15 @@ test_seen_path = data_dir / "test_seen.jsonl"
 
 def generate_metrics(test_path, tag):
     # make predictions using best-performing checkpoint params:
-    checkpoints = list(Path("model-outputs").glob("*.ckpt"))
+    checkpoints = list(Path("model-outputs").glob("epoch=3-step=379.ckpt"))
     assert len(checkpoints) == 1
 
     ckp = Path.cwd() / checkpoints[0]
     hateful_memes_model = HatefulMemesModel.load_from_checkpoint(checkpoints[0])
+    hateful_memes_model.to(torch.device('cuda'))
+
+    print("hmd model device = " + str(hateful_memes_model.device))
+
     predictions = hateful_memes_model.make_submission_frame(test_path=str(test_path))
 
     predictions.head()
